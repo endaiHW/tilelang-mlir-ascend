@@ -1633,6 +1633,110 @@ void CodeGenTileLangNPUIRAPI::DebugPrintCodegen(const CallNode *op) {
                                        mlir::hivm::TCoreTypeAttr{});
 }
 
+void CodeGenTileLangNPUIRAPI::ReshapeCodegen(const CallNode *op) {
+  tvm::tl::NpuirReshape npuirop(op->args, this->vmap);
+  mlir::Location loc = builder.getUnknownLoc();
+
+  mlir::Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
+  auto srcTy = src.getType().cast<mlir::MemRefType>();
+  auto elemTy = srcTy.getElementType();
+  auto memSpace = srcTy.getMemorySpace();
+
+  std::vector<tvm::PrimExpr> dstShape = npuirop.dst_shape;
+
+  SmallVector<tvm::PrimExpr> stridesVec;
+  stridesVec.reserve(dstShape.size());
+  tvm::PrimExpr strideExpr = tvm::Integer(1);
+  for (int i = static_cast<int>(dstShape.size()) - 1; i >= 0; --i) {
+    stridesVec.push_back(strideExpr);
+    strideExpr = strideExpr * dstShape[i];
+  }
+  std::reverse(stridesVec.begin(), stridesVec.end());
+
+  auto toIndexValue = [&](const tvm::PrimExpr &e) -> mlir::Value {
+    mlir::Value v = MakeValue(e);
+    if (!v.getType().isIndex()) {
+      v = builder.create<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), v);
+    }
+    return v;
+  };
+
+  bool allStatic = std::all_of(dstShape.begin(), dstShape.end(),
+      [](const tvm::PrimExpr &e) { return e.as<tvm::IntImmNode>() != nullptr; });
+
+  SmallVector<int64_t> dstShapeForType;
+  dstShapeForType.reserve(dstShape.size());
+  for (auto s : dstShape) {
+    if (auto imm = s.as<tvm::IntImmNode>()) {
+      dstShapeForType.push_back(static_cast<int64_t>(imm->value));
+    } else {
+      dstShapeForType.push_back(mlir::ShapedType::kDynamic);
+    }
+  }
+
+  SmallVector<int64_t> stridesForType;
+  if (allStatic) {
+    stridesForType.reserve(dstShape.size());
+    int64_t stride = 1;
+    for (int i = static_cast<int>(dstShape.size()) - 1; i >= 0; --i) {
+      stridesForType.push_back(stride);
+      auto imm = dstShape[i].as<tvm::IntImmNode>();
+      stride *= imm->value;
+    }
+    std::reverse(stridesForType.begin(), stridesForType.end());
+  } else {
+    stridesForType.resize(dstShape.size(), mlir::ShapedType::kDynamic);
+  }
+
+  auto layoutAttr = mlir::StridedLayoutAttr::get(
+      builder.getContext(),
+      /*offset=*/0,
+      stridesForType);
+
+  auto dstMemRefTy = mlir::MemRefType::get(
+      dstShapeForType,
+      elemTy,
+      layoutAttr,
+      memSpace);
+
+  SmallVector<mlir::OpFoldResult> offsets;
+  offsets.reserve(dstShape.size());
+  for (size_t i = 0; i < dstShape.size(); ++i) {
+    offsets.push_back(builder.getIndexAttr(0));
+  }
+
+  SmallVector<mlir::OpFoldResult> sizes;
+  sizes.reserve(dstShape.size());
+  for (auto s : dstShape) {
+    if (allStatic) {
+      auto imm = s.as<tvm::IntImmNode>();
+      sizes.push_back(builder.getIndexAttr(imm->value));
+    } else {
+      sizes.push_back(toIndexValue(s));
+    }
+  }
+
+  SmallVector<mlir::OpFoldResult> strides;
+  strides.reserve(stridesVec.size());
+  for (size_t i = 0; i < stridesVec.size(); ++i) {
+    if (allStatic) {
+      strides.push_back(builder.getIndexAttr(stridesForType[i]));
+    } else {
+      strides.push_back(toIndexValue(stridesVec[i]));
+    }
+  }
+
+  mlir::Value reshaped = builder.create<mlir::memref::ReinterpretCastOp>(
+      loc,
+      dstMemRefTy,
+      src,
+      offsets,
+      sizes,
+      strides);
+
+  var_map_[npuirop.dst->data.get()] = reshaped;
+}
+
 void CodeGenTileLangNPUIRAPI::CallExternCodegen(const CallNode *op) {
   // Todo: Implementation pending
 }
@@ -1995,6 +2099,8 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_debug_print_var")) ||
              op->op.same_as(Op::Get("tl.npuir_debug_print_buffer_value"))) {
     DebugPrintCodegen(op);
+  } else if (op->op.same_as(Op::Get("tl.npuir_reshape"))) {
+    ReshapeCodegen(op);
   } else {
     VisitExpr_(op);
   }
