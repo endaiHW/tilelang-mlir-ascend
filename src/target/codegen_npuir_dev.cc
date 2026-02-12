@@ -1374,14 +1374,116 @@ bool CodeGenTileLangNPUIRDEV::IsStaticOneOFR(mlir::OpFoldResult ofr) const {
 // keptIdx: original indices kept.
 CodeGenTileLangNPUIRDEV::CollapsedDims
 CodeGenTileLangNPUIRDEV::CollapseStaticOneDims(
-    llvm::ArrayRef<mlir::OpFoldResult> fullSizes) {
+    llvm::ArrayRef<mlir::OpFoldResult> fullSizes,
+    int64_t maxRank) {
   CollapsedDims out;
   out.sizes.reserve(fullSizes.size());
   out.projected.reserve(fullSizes.size());
   out.keptIdx.reserve(fullSizes.size());
 
+  int64_t rank = static_cast<int64_t>(fullSizes.size());
+  if (rank == 0) return out;
+
+  // Remove all static-1 dims.
+  if (maxRank < 0) {
+    for (unsigned i = 0; i < fullSizes.size(); ++i) {
+      if (IsStaticOneOFR(fullSizes[i])) continue;
+      out.keptIdx.push_back(i);
+      out.sizes.push_back(fullSizes[i]);
+      if (auto attr = fullSizes[i].dyn_cast<mlir::Attribute>()) {
+        out.projected.push_back(attr.cast<mlir::IntegerAttr>().getInt());
+      } else {
+        out.projected.push_back(mlir::ShapedType::kDynamic);
+      }
+    }
+    if (out.sizes.empty()) {
+      out.sizes.push_back(builder.getIndexAttr(1));
+      out.projected.push_back(1);
+      out.keptIdx.push_back(0);  // dummy
+    }
+    return out;
+  }
+
+  // 1) Classify dims: record non-1 (must-keep) and 1-dims (candidates).
+  llvm::SmallVector<unsigned> oneIdx;
+  llvm::SmallVector<bool> isOneFlags;
+  isOneFlags.reserve(fullSizes.size());
+
+  int64_t nonOneCount = 0;
+  int64_t firstNonOne = -1, lastNonOne = -1;
   for (unsigned i = 0; i < fullSizes.size(); ++i) {
-    if (IsStaticOneOFR(fullSizes[i])) continue;  // drop static 1
+    bool isOne = IsStaticOneOFR(fullSizes[i]);
+    isOneFlags.push_back(isOne);
+    if (isOne) {
+      oneIdx.push_back(i);
+    } else {
+      if (firstNonOne < 0) firstNonOne = i;
+      lastNonOne = i;
+      ++nonOneCount;
+    }
+  }
+
+  // If no non-1 dims, collapse to a single dim=1.
+  if (nonOneCount == 0) {
+    out.keptIdx.push_back(0);
+    out.sizes.push_back(builder.getIndexAttr(1));
+    out.projected.push_back(1);
+    return out;
+  }
+
+  // Clamp maxRank to be at least the number of non-1 dims.
+  if (maxRank < nonOneCount) maxRank = nonOneCount;
+  if (maxRank > rank) maxRank = rank;
+
+  int64_t numToRemove = rank - maxRank;
+  if (numToRemove <= 0 || oneIdx.empty()) {
+    // Nothing to remove; keep all dims.
+    for (unsigned i = 0; i < fullSizes.size(); ++i) {
+      out.keptIdx.push_back(i);
+      out.sizes.push_back(fullSizes[i]);
+      if (auto attr = fullSizes[i].dyn_cast<mlir::Attribute>()) {
+        out.projected.push_back(attr.cast<mlir::IntegerAttr>().getInt());
+      } else {
+        out.projected.push_back(mlir::ShapedType::kDynamic);
+      }
+    }
+    return out;
+  }
+
+  // 2) Decide which 1-dims to remove by priority:
+  //    leading-1 -> middle-1 -> trailing-1.
+  llvm::SmallVector<bool> removeFlags(rank, false);
+
+  auto removeByRange = [&](int64_t start, int64_t end, int64_t& remaining) {
+    for (int64_t i = start; i <= end && remaining > 0; ++i) {
+      if (i < 0 || i >= rank) continue;
+      if (!isOneFlags[i]) continue;
+      removeFlags[i] = true;
+      --remaining;
+    }
+  };
+
+  int64_t remaining = numToRemove;
+
+  // Leading 1s: [0, firstNonOne)
+  if (firstNonOne > 0) {
+    removeByRange(0, firstNonOne - 1, remaining);
+  }
+
+  // Middle 1s: (firstNonOne, lastNonOne)
+  if (remaining > 0 && firstNonOne >= 0 && lastNonOne >= 0 &&
+      lastNonOne - firstNonOne > 1) {
+    removeByRange(firstNonOne + 1, lastNonOne - 1, remaining);
+  }
+
+  // Trailing 1s: (lastNonOne, rank-1]
+  if (remaining > 0 && lastNonOne >= 0 && lastNonOne < rank - 1) {
+    removeByRange(lastNonOne + 1, rank - 1, remaining);
+  }
+
+  // 3) Build collapsed dims, skipping the removed ones.
+  for (unsigned i = 0; i < fullSizes.size(); ++i) {
+    if (removeFlags[i]) continue;
     out.keptIdx.push_back(i);
     out.sizes.push_back(fullSizes[i]);
     if (auto attr = fullSizes[i].dyn_cast<mlir::Attribute>()) {
@@ -1391,12 +1493,6 @@ CodeGenTileLangNPUIRDEV::CollapseStaticOneDims(
     }
   }
 
-  // If all dims are static 1, keep a single dim=1 (same as your original code)
-  if (out.sizes.empty()) {
-    out.sizes.push_back(builder.getIndexAttr(1));
-    out.projected.push_back(1);
-    out.keptIdx.push_back(0);  // dummy
-  }
   return out;
 }
 
@@ -1515,8 +1611,9 @@ CodeGenTileLangNPUIRDEV::ComputeUBAllocShapeFromDstRange(
 
   llvm::SmallVector<int64_t> ub_alloc_shape;
   ub_alloc_shape.reserve(rank);
+  // UB alloc should be compact: drop ALL static-1 dims.
   for (int64_t d : full_shape) {
-    if (d == 1) continue;  // drop static 1 as in original
+    if (d == 1) continue;
     ub_alloc_shape.push_back(d);
   }
   if (ub_alloc_shape.empty()) ub_alloc_shape.push_back(1);
@@ -1532,7 +1629,11 @@ void CodeGenTileLangNPUIRDEV::EmitCopyMemrefToTensor(
   auto src_memref_type_ori = src.getType().cast<mlir::MemRefType>();
 
   // 1) Canonicalize copy rank: drop static-1 dims using src_sizes
-  CollapsedDims srcC = CollapseStaticOneDims(srcR.sizes);
+  llvm::SmallVector<int64_t> ub_alloc_shape =
+      ComputeUBAllocShapeFromDstRange(dst_tensor_type_ori, dstR.sizes);
+  CollapsedDims srcC = CollapseStaticOneDims(
+      srcR.sizes,
+      static_cast<int64_t>(ub_alloc_shape.size()));
   llvm::ArrayRef<mlir::OpFoldResult> copy_sizes = srcC.sizes;
   llvm::ArrayRef<int64_t> copy_projected = srcC.projected;
 
@@ -1542,8 +1643,6 @@ void CodeGenTileLangNPUIRDEV::EmitCopyMemrefToTensor(
 
   // 3) Alloc UB from dst_range. kDynamic appears only when dst type has a dynamic dim;
   //    dst_range dynamic + dst static => static alloc (dst dim as bound), dynamic subview.
-  llvm::SmallVector<int64_t> ub_alloc_shape =
-      ComputeUBAllocShapeFromDstRange(dst_tensor_type_ori, dstR.sizes);
   bool has_dynamic = false;
   for (int64_t d : ub_alloc_shape) {
     if (mlir::ShapedType::isDynamic(d)) {
@@ -1568,7 +1667,9 @@ void CodeGenTileLangNPUIRDEV::EmitCopyMemrefToTensor(
       ub_view = CreateSameRankDynamicSubview(base_ub, copy_sizes, loc);
     }
   } else {
-    CollapsedDims dstC = CollapseStaticOneDims(dstR.sizes);
+    CollapsedDims dstC = CollapseStaticOneDims(
+        dstR.sizes,
+        static_cast<int64_t>(ubTy.getRank()));
 
     llvm::SmallVector<mlir::OpFoldResult> fullOffsets(ubTy.getRank(), builder.getIndexAttr(0));
     llvm::SmallVector<mlir::OpFoldResult> fullStrides(ubTy.getRank(), builder.getIndexAttr(1));
@@ -1619,8 +1720,25 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToMemref(
     const SliceRange& srcR, const SliceRange& dstR,
     mlir::Location loc) {
   
+  auto srcTy = src.getType().cast<mlir::RankedTensorType>();
+  auto dstTy = dst.getType().cast<mlir::MemRefType>();
+
+  // Fast path: full-range on both sides with same shape, skip all slicing
+  if (OpFoldResultsAllZero(srcR.offs) &&
+      OpFoldResultsEqualStaticShape(srcR.sizes, srcTy.getShape()) &&
+      OpFoldResultsAllZero(dstR.offs) &&
+      OpFoldResultsEqualStaticShape(dstR.sizes, dstTy.getShape()) &&
+      srcTy.getShape() == dstTy.getShape()) {
+    mlir::Value casted = CreateCastIfTypeMismatch(src, dst);
+    auto matOp = builder.create<mlir::bufferization::MaterializeInDestinationOp>(
+        loc, casted, dst);
+    matOp.setWritable(true);
+    return;
+  }
+
   // 1) Canonicalize copy rank: drop static-1 dims
-  CollapsedDims srcC = CollapseStaticOneDims(srcR.sizes);
+  int64_t maxRank = std::min<int64_t>(srcTy.getRank(), dstTy.getRank());
+  CollapsedDims srcC = CollapseStaticOneDims(srcR.sizes, maxRank);
   llvm::ArrayRef<mlir::OpFoldResult> copy_sizes = srcC.sizes;
   llvm::ArrayRef<int64_t> copy_projected = srcC.projected;
 
@@ -1646,21 +1764,28 @@ void CodeGenTileLangNPUIRDEV::EmitCopyTensorToTensor(
     mlir::Value src, mlir::Value dst,
     const SliceRange& srcR, const SliceRange& dstR,
     mlir::Location loc) {
-  mlir::Value src_slice;
   auto srcTy = src.getType().cast<mlir::RankedTensorType>();
+  auto dstTy = dst.getType().cast<mlir::RankedTensorType>();
+
+  // Fast path: full-range on both sides with same shape
   if (OpFoldResultsAllZero(srcR.offs) &&
-      OpFoldResultsEqualStaticShape(srcR.sizes, srcTy.getShape())) {
-    src_slice = src;
-  } else {
-    src_slice = builder.create<mlir::tensor::ExtractSliceOp>(
-        loc, src, srcR.offs, srcR.sizes, srcR.strides).getResult();
+      OpFoldResultsEqualStaticShape(srcR.sizes, srcTy.getShape()) &&
+      OpFoldResultsAllZero(dstR.offs) &&
+      OpFoldResultsEqualStaticShape(dstR.sizes, dstTy.getShape()) &&
+      srcTy.getShape() == dstTy.getShape()) {
+    mlir::Value casted = CreateCastIfTypeMismatch(src, dst);
+    SetVarValue(npuirop.dst, casted);
+    return;
   }
 
-  // Use tensor.reshape instead of expand_shape/collapse_shape to avoid
-  // bufferization failures on tensors derived from strided memrefs.
-  mlir::Value reshaped_tensor = ReshapeTensorWithTensorReshape(src_slice, dstR.sizes);
+  // General path: rank-reducing extract_slice + insert_slice (no reshape needed)
+  // MLIR's extract_slice supports rank reduction, and insert_slice supports source rank < dest rank
+  int64_t maxRankTT = std::min<int64_t>(srcTy.getRank(), dstTy.getRank());
+  CollapsedDims srcC = CollapseStaticOneDims(srcR.sizes, maxRankTT);
+  mlir::Value src_slice = CreateRankReducedExtractSlice(
+      src, srcR.offs, srcR.sizes, srcR.strides, srcC.projected, loc);
 
-  mlir::Value casted_tensor = CreateCastIfTypeMismatch(reshaped_tensor, dst);
+  mlir::Value casted_tensor = CreateCastIfTypeMismatch(src_slice, dst);
 
   mlir::Value result = InsertSlice(
       casted_tensor, dst,
