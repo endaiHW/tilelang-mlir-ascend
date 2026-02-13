@@ -264,6 +264,11 @@ private:
   mlir::Value GenMemrefLoadFromRegion(const BufferLoadNode *op);
   mlir::Value GenSubviewFromRegion(const CallNode *region_node);
   mlir::Value GenSubviewFromRegion(Buffer buffer_data, Array<Range> range);
+  // Similar to GenSubviewFromRegion but performs rank reduction by dropping
+  // static-1 dimensions from the slice sizes (Region extents).
+  mlir::Value GenRankReducedSubviewFromRegion(Buffer buffer_data,
+                                              Array<Range> range,
+                                              int min_rank = 0);
   mlir::Value CreateIndexCastOp(mlir::Value src);
   std::pair<bool, mlir::Value> CheckMLIRValueMap(mlir::Value val);
   std::pair<bool, mlir::Value> CheckPrimExprMap(const PrimExprNode * op);
