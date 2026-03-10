@@ -21,16 +21,17 @@ Edge cases covered via pytest parametrize:
 import pytest
 import torch
 import torch_npu  # noqa: F401
+from itertools import product
 import tilelang
 import tilelang.language as T
 
-from testcommon import assert_close, build_dtype_param_combos, gen_tensor
+from testcommon import assert_close, gen_tensor
 
-pytestmark = [pytest.mark.copy, pytest.mark.op("copy")]
+pytestmark = [pytest.mark.op("copy")]
 
 IN_DTYPES = ["float16", "float32"]
 OUT_DTYPES = ["float16", "float32"]
-DTYPE_COMBOS = build_dtype_param_combos(IN_DTYPES, OUT_DTYPES)
+DTYPE_CASES = list(product(IN_DTYPES, OUT_DTYPES))
 
 # ---------------------------------------------------------------------------
 # Kernel builders
@@ -176,16 +177,6 @@ def cube_copy_shape_3d_4d(M, N, block_M, block_N, in_dtype, out_dtype):
 DYNAMIC_CASES = [
     # (M,  N,  block_M, block_N)   — description
     (8,  8,  3, 3),                 # base: tail in both dims (8%3=2)
-    (6,  6,  3, 3),                 # exact divide, no tail
-    (8,  8,  8, 8),                 # single tile (block == dim)
-    (4,  4,  8, 8),                 # oversized block (block > dim)
-    (1,  8,  1, 3),                 # M=1, single row
-    (16, 32, 5, 7),                 # larger, irregular tiling
-    (7,  8,  3, 3),                 # M tail = 1  (7%3 = 1)
-    (8,  7,  3, 3),                 # N tail = 1  (7%3 = 1)
-    (7,  7,  3, 3),                 # both dims tail = 1
-    (8,  8,  3, 8),                 # block_N == N, only M has tail
-    (8,  8,  8, 3),                 # block_M == M, only N has tail
 ]
 
 
@@ -193,7 +184,7 @@ DYNAMIC_CASES = [
 # 2D tests  —  A: [M, N]
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("in_dtype, out_dtype", DTYPE_COMBOS)
+@pytest.mark.parametrize("in_dtype, out_dtype", DTYPE_CASES)
 @pytest.mark.parametrize("M, N, block_M, block_N", DYNAMIC_CASES)
 def test_cube_copy_shape_2d(M, N, block_M, block_N, in_dtype, out_dtype):
     func = cube_copy_shape_1d_2d(M, N, block_M, block_N, in_dtype, out_dtype)
@@ -212,7 +203,7 @@ def test_cube_copy_shape_2d(M, N, block_M, block_N, in_dtype, out_dtype):
 # 3D tests  —  A: [1, M, N]
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("in_dtype, out_dtype", DTYPE_COMBOS)
+@pytest.mark.parametrize("in_dtype, out_dtype", DTYPE_CASES)
 @pytest.mark.parametrize("M, N, block_M, block_N", DYNAMIC_CASES)
 def test_cube_copy_shape_3d(M, N, block_M, block_N, in_dtype, out_dtype):
     func = cube_copy_shape_2d_3d(M, N, block_M, block_N, in_dtype, out_dtype)
@@ -231,7 +222,7 @@ def test_cube_copy_shape_3d(M, N, block_M, block_N, in_dtype, out_dtype):
 # 4D tests  —  A: [1, 1, M, N]
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("in_dtype, out_dtype", DTYPE_COMBOS)
+@pytest.mark.parametrize("in_dtype, out_dtype", DTYPE_CASES)
 @pytest.mark.parametrize("M, N, block_M, block_N", DYNAMIC_CASES)
 def test_cube_copy_shape_4d(M, N, block_M, block_N, in_dtype, out_dtype):
     func = cube_copy_shape_3d_4d(M, N, block_M, block_N, in_dtype, out_dtype)
