@@ -1,12 +1,12 @@
 # Copyright (c) Tile-AI Organization.
 # Licensed under the MIT License.
-import os
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
 from typing import Optional
+from tilelang.utils import get_ascend_device_name, supports_native_bf16
 
 
 def allow_warp_specialized(
@@ -53,29 +53,14 @@ def allow_vectorize(pass_ctx: Optional[PassContext] = None) -> bool:
     return not disable_vectorize
 
 
-def get_ascend_device_name() -> str:
-    for env_name in (
-        "TILELANG_ASCEND_DEVICE_NAME",
-        "ASCEND_DEVICE_NAME",
-        "DEVICE_NAME",
-    ):
-        device_name = os.environ.get(env_name)
-        if device_name:
-            return device_name.strip()
-    return ""
-
-
-def supports_native_bf16_npuir_add(device_name: str) -> bool:
-    # Placeholder for future device capability table keyed by device_name.
-    _ = device_name
-    return False
+# Chip capabilities and device discovery are now handled in tilelang.utils.npu_chip
 
 
 def need_npuir_bf16_legalize(target: Optional[Target] = None) -> bool:
     if target is None or target.kind.name != "npuir":
         return False
 
-    return not supports_native_bf16_npuir_add(get_ascend_device_name())
+    return not supports_native_bf16(get_ascend_device_name())
 
 
 def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
